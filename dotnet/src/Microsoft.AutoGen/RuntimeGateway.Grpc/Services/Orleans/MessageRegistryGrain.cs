@@ -4,53 +4,79 @@
 using Microsoft.AutoGen.Contracts;
 using Microsoft.AutoGen.RuntimeGateway.Grpc.Abstractions;
 using Microsoft.Extensions.Logging;
+using Orleans.Concurrency;
 
 namespace Microsoft.AutoGen.RuntimeGateway.Grpc;
-
-internal sealed class MessageRegistryGrain(
-    [PersistentState("state", "PubSubStore")] IPersistentState<MessageRegistryState> state,
-    ILogger<MessageRegistryGrain> logger
-) : Grain, IMessageRegistryGrain
+[Reentrant]
+internal sealed class MessageRegistryGrain : Grain, IMessageRegistryGrain
 {
-    private const int _retries = 5;
-    private readonly ILogger<MessageRegistryGrain> _logger = logger;
-
-    public async Task WriteMessageAsync(string topic, CloudEvent message)
+    public enum QueueType
     {
-        var retries = _retries;
-        while (!await WriteMessageAsync(topic, message, state.Etag).ConfigureAwait(false))
-        {
-            if (retries-- <= 0)
-            {
-                throw new InvalidOperationException($"Failed to write MessageRegistryState after {_retries} retries.");
-            }
-            _logger.LogWarning("Failed to write MessageRegistryState. Retrying...");
-            retries--;
-        }
-    }
-    private async ValueTask<bool> WriteMessageAsync(string topic, CloudEvent message, string etag)
-    {
-        if (state.Etag != null && state.Etag != etag)
-        {
-            return false;
-        }
-        var queue = state.State.DeadLetterQueue.GetOrAdd(topic, _ => new());
-        queue.Add(message);
-        state.State.DeadLetterQueue.AddOrUpdate(topic, queue, (_, _) => queue);
-        await state.WriteStateAsync().ConfigureAwait(true);
-        return true;
+        DeadLetterQueue,
+        EventBuffer
     }
 
+    /// <summary>
+    /// The time to wait before removing a message from the event buffer.
+    /// in milliseconds
+    /// </summary>
+    private const int _bufferTime = 5000;
+
+    /// <summary>
+    /// maximum size of a message we will write to the state store in bytes
+    /// </summary>
+    /// <remarks>set this to HALF your intended limit as protobuf strings are UTF8 but .NET UTF16</remarks>
+    private const int _maxMessageSize = 1024 * 1024 * 10; // 10MB
+
+    /// <summary>
+    /// maximum size of a each queue
+    /// </summary>
+    /// <remarks>set this to HALF your intended limit as protobuf strings are UTF8 but .NET UTF16</remarks>
+    private const int _maxQueueSize = 1024 * 1024 * 10; // 10MB
+
+    private readonly MessageRegistryQueue _dlqQueue;
+    private readonly MessageRegistryQueue _ebQueue;
+
+    public MessageRegistryGrain(
+        [PersistentState("state", "PubSubStore")] IPersistentState<MessageRegistryState> state,
+        ILogger<MessageRegistryGrain> logger)
+    {
+        var stateManager = new StateManager(state);
+        _dlqQueue = new MessageRegistryQueue(
+            QueueType.DeadLetterQueue,
+            state,
+            stateManager,
+            logger,
+            _maxMessageSize,
+            _maxQueueSize);
+
+        _ebQueue = new MessageRegistryQueue(
+            QueueType.EventBuffer,
+            state,
+            stateManager,
+            logger,
+            _maxMessageSize,
+            _maxQueueSize);
+    }
+
+    // <inheritdoc />
+    public async Task AddMessageToDeadLetterQueueAsync(string topic, CloudEvent message)
+    {
+        await _dlqQueue.AddMessageAsync(topic, message);
+    }
+
+    ///<inheritdoc />
+    public async Task AddMessageToEventBufferAsync(string topic, CloudEvent message)
+    {
+        await _ebQueue.AddMessageAsync(topic, message);
+        _ebQueue.RemoveMessageAfterDelayAsync(topic, message, _bufferTime).Ignore();
+    }
+
+    // <inheritdoc />
     public async Task<List<CloudEvent>> RemoveMessagesAsync(string topic)
     {
-        if (state.State.DeadLetterQueue != null && state.State.DeadLetterQueue.Remove(topic, out List<CloudEvent>? letters))
-        {
-            await state.WriteStateAsync().ConfigureAwait(true);
-            if (letters != null)
-            {
-                return letters;
-            }
-        }
-        return [];
+        var removedDeadLetter = await _dlqQueue.RemoveMessagesAsync(topic);
+        var removedBuffer = await _ebQueue.RemoveMessagesAsync(topic);
+        return removedDeadLetter.Concat(removedBuffer).ToList();
     }
 }
