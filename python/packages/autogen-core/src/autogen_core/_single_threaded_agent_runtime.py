@@ -160,6 +160,7 @@ class SingleThreadedAgentRuntime(AgentRuntime):
         intervention_handlers (List[InterventionHandler], optional): A list of intervention
             handlers that can intercept messages before they are sent or published. Defaults to None.
         tracer_provider (TracerProvider, optional): The tracer provider to use for tracing. Defaults to None.
+            Additionally, you can set environment variable `AUTOGEN_DISABLE_RUNTIME_TRACING` to `true` to disable the agent runtime telemetry if you don't have access to the runtime constructor. For example, if you are using `ComponentConfig`.
         ignore_unhandled_exceptions (bool, optional): Whether to ignore unhandled exceptions in that occur in agent event handlers. Any background exceptions will be raised on the next call to `process_next` or from an awaited `stop`, `stop_when_idle` or `stop_when`. Note, this does not apply to RPC handlers. Defaults to True.
 
     Examples:
@@ -362,6 +363,7 @@ class SingleThreadedAgentRuntime(AgentRuntime):
             future = asyncio.get_event_loop().create_future()
             if recipient.type not in self._known_agent_names:
                 future.set_exception(Exception("Recipient not found"))
+                return await future
 
             content = message.__dict__ if hasattr(message, "__dict__") else message
             logger.info(f"Sending message of type {type(message).__name__} to {recipient.type}: {content}")
